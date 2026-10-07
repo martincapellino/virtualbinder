@@ -10,14 +10,44 @@ const useBinder = () => {
 
 function BinderProvider({ children }) {
   const [binders, setBinders] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("vb_binders") || "[]"); } catch { return []; }
+    try {
+      const stored = localStorage.getItem("vb_binders");
+      if (!stored) return [];
+      const parsed = JSON.parse(stored);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch { return []; }
   });
-  const [activeBinder, setActiveBinder] = useState(null);
+
   const [currentPage, setCurrentPage] = useState(0);
 
   const save = useCallback((next) => {
     setBinders(next);
-    localStorage.setItem("vb_binders", JSON.stringify(next));
+    try {
+      localStorage.setItem("vb_binders", JSON.stringify(next));
+    } catch (e) {
+      console.error("Error guardando binders:", e);
+    }
+  }, []);
+
+  // Restaurar el último binder activo entre recargas
+  const [activeBinder, setActiveBinderRaw] = useState(() => {
+    try {
+      const stored = localStorage.getItem("vb_binders");
+      const parsed = stored ? JSON.parse(stored) : [];
+      const lastId = localStorage.getItem("vb_active_id");
+      if (lastId && Array.isArray(parsed)) {
+        return parsed.find(b => b.id === lastId) || null;
+      }
+      return null;
+    } catch { return null; }
+  });
+
+
+  const setActiveBinder = useCallback((b) => {
+    setActiveBinderRaw(b);
+    try {
+      localStorage.setItem("vb_active_id", b ? b.id : "");
+    } catch {}
   }, []);
 
   const createBinder = useCallback(({ name, pages, grid, color, texture }) => {
@@ -39,12 +69,35 @@ function BinderProvider({ children }) {
     if (activeBinder?.id === id) { setActiveBinder(null); setCurrentPage(0); }
   }, [binders, save, activeBinder]);
 
+  const updateBinder = useCallback(({ id, name, color, texture }) => {
+    const next = binders.map((b) =>
+      b.id === id ? { ...b, name, color, texture } : b
+    );
+    save(next);
+    if (activeBinder?.id === id) {
+      setActiveBinderRaw((prev) => ({ ...prev, name, color, texture }));
+    }
+  }, [binders, save, activeBinder]);
+
   const addCardToSlot = useCallback((pageIndex, slotIndex, card) => {
     if (!activeBinder) return;
     const updated = activeBinder.pages.map((page, pi) =>
       pi === pageIndex ? page.map((slot, si) => (si === slotIndex ? card : slot)) : page
     );
     const ub = { ...activeBinder, pages: updated };
+    save(binders.map((b) => (b.id === activeBinder.id ? ub : b)));
+    setActiveBinder(ub);
+  }, [activeBinder, binders, save]);
+
+  const swapSlots = useCallback(({ srcPage, srcSlot, dstPage, dstSlot }) => {
+    if (!activeBinder) return;
+    const pages = activeBinder.pages.map(p => [...p]);
+    const srcCard = pages[srcPage]?.[srcSlot];
+    const dstCard = pages[dstPage]?.[dstSlot];
+    if (srcCard === undefined || dstCard === undefined) return;
+    pages[srcPage][srcSlot] = dstCard;
+    pages[dstPage][dstSlot] = srcCard;
+    const ub = { ...activeBinder, pages };
     save(binders.map((b) => (b.id === activeBinder.id ? ub : b)));
     setActiveBinder(ub);
   }, [activeBinder, binders, save]);
@@ -65,7 +118,7 @@ function BinderProvider({ children }) {
     <BinderContext.Provider value={{
       binders, activeBinder, currentPage, setCurrentPage,
       setActiveBinder: (b) => { setActiveBinder(b); setCurrentPage(0); },
-      createBinder, deleteBinder, addCardToSlot, removeCardFromSlot, getTotalCost,
+      createBinder, deleteBinder, updateBinder, addCardToSlot, swapSlots, removeCardFromSlot, getTotalCost,
     }}>
       {children}
     </BinderContext.Provider>
@@ -75,85 +128,194 @@ function BinderProvider({ children }) {
 // ─── API ────────────────────────────────────────────────────────────────────
 const API_BASE = "/api/v2";
 
-function buildQuery(name, filters) {
+// Cache de sets
+let _setsCache = null;
+async function getSetsCache() {
+  if (_setsCache) return _setsCache;
+  const res = await fetch(`${API_BASE}/sets?orderBy=-releaseDate&pageSize=250&select=id,name,series`);
+  if (!res.ok) return [];
+  _setsCache = (await res.json()).data || [];
+  return _setsCache;
+}
+
+// Normaliza texto para comparación flexible
+function normalize(str) {
+  return (str || "")
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, "")
+    .trim();
+}
+
+// Tokeniza en palabras únicas de al menos 2 letras
+function tokens(str) {
+  return normalize(str).split(/\s+/).filter(t => t.length >= 2);
+}
+
+// Dado el texto libre, encuentra el set que mejor matchea.
+// Estrategia: el set cuyas palabras están más representadas en el input.
+// Ej: "eevee prismatic" → "Prismatic Evolutions" tiene 1/2 palabras = 50% → gana si nadie más matchea.
+// Ej: "eevee prismatic evolutions" → 2/2 palabras = 100%.
+async function detectIntent(raw) {
+  if (!raw.trim()) return { cardName: "", setId: null, setName: null };
+  const sets = await getSetsCache();
+  const inputTokens = tokens(raw);
+  if (!inputTokens.length) return { cardName: raw.trim(), setId: null, setName: null };
+
+  let bestSet = null;
+  let bestScore = 0;   // proporción de tokens del set que aparecen en el input
+  let bestMatched = 0; // cantidad de tokens del set matcheados (desempate)
+
+  for (const s of sets) {
+    const setTokens = tokens(s.name);
+    if (!setTokens.length) continue;
+
+    // Cuántos tokens del SET aparecen en el INPUT
+    // Usamos match estricto: solo prefix si ambos tokens tienen al menos 4 chars
+    const matched = setTokens.filter(st =>
+      inputTokens.some(it =>
+        it === st ||
+        (it.startsWith(st) && st.length >= 4) ||
+        (st.startsWith(it) && it.length >= 4)
+      )
+    ).length;
+    if (matched === 0) continue;
+
+    const score = matched / setTokens.length; // 1.0 = todas las palabras del set están en el input
+
+    // Gana el que tenga mayor score; en empate, el que tenga más tokens matcheados (set más específico)
+    if (score > bestScore || (score === bestScore && matched > bestMatched)) {
+      bestSet = s;
+      bestScore = score;
+      bestMatched = matched;
+    }
+  }
+
+  // Solo aceptamos el set si al menos el 50% de sus palabras aparecen en el input
+  // Para sets cortos (1-2 tokens) exigimos match completo para evitar falsos positivos
+  const minScore = bestSet && tokens(bestSet.name).length <= 2 ? 1.0 : 0.5;
+  if (bestSet && bestScore >= minScore) {
+    // Quitamos del input los tokens que pertenecen al set → lo que queda es el nombre de carta
+    const setToks = tokens(bestSet.name);
+    const cardTokens = inputTokens.filter(it =>
+      !setToks.some(st => it.startsWith(st) || st.startsWith(it))
+    );
+    const cardName = cardTokens.join(" ");
+    return { cardName, setId: bestSet.id, setName: bestSet.name };
+  }
+
+  return { cardName: raw.trim(), setId: null, setName: null };
+}
+
+function buildFilterParts(filters) {
   const parts = [];
-  if (name?.trim()) parts.push(`name:"${name.trim()}*"`);
   if (filters.rarity)    parts.push(`rarity:"${filters.rarity}"`);
   if (filters.set)       parts.push(`set.id:"${filters.set}"`);
   if (filters.type)      parts.push(`types:${filters.type}`);
   if (filters.subtype)   parts.push(`subtypes:"${filters.subtype}"`);
   if (filters.supertype) parts.push(`supertype:${filters.supertype}`);
   if (filters.legality)  parts.push(`legalities.${filters.legality}:legal`);
-  return parts.join(" ");
-}
-
-function buildFallbackQueries(name, filters) {
-  const raw = name?.trim() || "";
-  const queries = [];
-  const q1 = buildQuery(raw, filters);
-  if (q1) queries.push(q1);
-  if (raw.includes(" ")) {
-    const tokens = raw.split(/\s+/);
-    const firstName = tokens[0];
-    const rest = tokens.slice(1).join(" ");
-    const q2 = buildQuery(firstName, filters);
-    if (q2 && !queries.includes(q2)) queries.push(q2);
-    const parts3 = [`name:"${firstName}*"`, `set.name:"*${rest}*"`];
-    if (filters.rarity) parts3.push(`rarity:"${filters.rarity}"`);
-    if (filters.type)   parts3.push(`types:${filters.type}`);
-    const q3 = parts3.join(" ");
-    if (!queries.includes(q3)) queries.push(q3);
-    const parts4 = [`name:"${firstName}*"`, `set.series:"*${rest}*"`];
-    const q4 = parts4.join(" ");
-    if (!queries.includes(q4)) queries.push(q4);
-  }
-  return queries;
+  return parts;
 }
 
 async function rawFetch(q, page, pageSize) {
   const params = new URLSearchParams({
     q, page, pageSize,
     select: "id,name,images,set,cardmarket,tcgplayer,rarity,types,subtypes,supertype,number",
-    orderBy: "set.releaseDate,-number",
+    orderBy: "number",
   });
   const res = await fetch(`${API_BASE}/cards?${params}`);
   if (!res.ok) throw new Error("Error al buscar cartas (status " + res.status + ")");
   return res.json();
 }
 
-async function searchCards(name, filters = {}, page = 1, pageSize = 36) {
-  const queries = buildFallbackQueries(name, filters);
-  if (!queries.length) return { data: [], totalCount: 0, page, pageSize };
-  let lastData = { data: [], totalCount: 0, page, pageSize };
-  for (const q of queries) {
-    const data = await rawFetch(q, page, pageSize);
-    if ((data.data || []).length > 0) return data;
-    lastData = data;
+async function searchCards(rawQuery, filters = {}, page = 1, pageSize = 36) {
+  const filterParts = buildFilterParts(filters);
+  const empty = { data: [], totalCount: 0, page, pageSize };
+
+  // Si hay set en filtro explícito (dropdown), búsqueda directa sin detección
+  if (filters.set) {
+    const namePart = rawQuery?.trim() ? [`name:"${rawQuery.trim()}*"`] : [];
+    const q = [...namePart, ...filterParts].join(" ");
+    if (!q) return empty;
+    return rawFetch(q, page, pageSize);
   }
-  return lastData;
+
+  // Sin query ni filtros → vacío
+  if (!rawQuery?.trim() && !filterParts.length) return empty;
+
+  // Detección inteligente
+  const { cardName, setId } = await detectIntent(rawQuery || "");
+
+  const parts = [];
+  if (cardName) parts.push(`name:"${cardName}*"`);
+  if (setId)    parts.push(`set.id:"${setId}"`);
+  parts.push(...filterParts);
+
+  if (!parts.length) return empty;
+
+  const data = await rawFetch(parts.join(" "), page, pageSize);
+
+  // Fallback: si no encontró nada y hay cardName sin set detectado,
+  // intentar con cada token por separado (ej: "gengar holo" → name:"gengar*" name:"holo*")
+  if ((data.data || []).length === 0 && cardName && !setId) {
+    const toks = cardName.split(/\s+/).filter(t => t.length >= 2);
+    if (toks.length > 1) {
+      const flexQ = [...toks.map(t => `name:"${t}*"`), ...filterParts].join(" ");
+      const flex = await rawFetch(flexQ, page, pageSize);
+      if ((flex.data || []).length > 0) return flex;
+    }
+  }
+
+  return data;
 }
 
-async function autocomplete(query) {
-  if (!query || query.length < 2) return [];
-  const firstName = query.trim().split(/\s+/)[0];
+async function autocomplete(query, sets = []) {
+  if (!query || query.length < 2) return { cards: [], matchedSet: null };
+  const inputToks = tokens(query);
+
+  // Buscar el mejor set que matchee (misma lógica que detectIntent)
+  const setsData = sets.length ? sets : await getSetsCache();
+  let matchedSet = null;
+  let bestScore = 0;
+  let bestMatched = 0;
+
+  for (const s of setsData) {
+    const setToks = tokens(s.name);
+    if (!setToks.length) continue;
+    const matched = setToks.filter(st => inputToks.some(it => it.startsWith(st) || st.startsWith(it))).length;
+    if (matched === 0) continue;
+    const score = matched / setToks.length;
+    if (score > bestScore || (score === bestScore && matched > bestMatched)) {
+      matchedSet = s; bestScore = score; bestMatched = matched;
+    }
+  }
+  if (bestScore < 0.5) matchedSet = null;
+
+  // Cartas: buscar por el primer token que NO pertenezca al set matcheado
+  const setToksMatched = matchedSet ? tokens(matchedSet.name) : [];
+  const cardTokens = inputToks.filter(it =>
+    !setToksMatched.some(st => it.startsWith(st) || st.startsWith(it))
+  );
+  const searchToken = cardTokens[0] || inputToks[0];
+
   const params = new URLSearchParams({
-    q: `name:"${firstName}*"`, pageSize: 8,
+    q: `name:"${searchToken}*"`, pageSize: 8,
     select: "id,name,set,images", orderBy: "name",
   });
   const res = await fetch(`${API_BASE}/cards?${params}`);
-  if (!res.ok) return [];
-  const data = await res.json();
+  const cards = res.ok ? (await res.json()).data || [] : [];
   const seen = new Set();
-  return (data.data || []).filter((c) => {
+  const uniqueCards = cards.filter((c) => {
     if (seen.has(c.name)) return false;
     seen.add(c.name); return true;
   });
+
+  return { cards: uniqueCards, matchedSet };
 }
 
 async function fetchSets() {
-  const res = await fetch(`${API_BASE}/sets?orderBy=-releaseDate&pageSize=250&select=id,name,series`);
-  if (!res.ok) return [];
-  return (await res.json()).data || [];
+  return getSetsCache();
 }
 
 async function fetchRarities() {
@@ -166,6 +328,7 @@ function getPriceChartingUrl(card) {
   if (!card) return null;
   return `https://www.pricecharting.com/search-products?q=${encodeURIComponent(card.name + " " + (card.set?.name || ""))}&type=pokemon`;
 }
+
 
 // ─── TEXTURE PATTERNS (CSS) ──────────────────────────────────────────────────
 const TEXTURES = {
@@ -270,6 +433,8 @@ const Icon = {
   Layers: (p) => <svg {...p} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><polygon points="12 2 2 7 12 12 22 7 12 2" /><polyline points="2 17 12 22 22 17" /><polyline points="2 12 12 17 22 12" /></svg>,
   ZoomIn: (p) => <svg {...p} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" strokeLinecap="round" /><path d="M11 8v6M8 11h6" strokeLinecap="round" /></svg>,
   ExternalLink: (p) => <svg {...p} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6" strokeLinecap="round" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" /></svg>,
+  Edit: (p) => <svg {...p} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" strokeLinecap="round" strokeLinejoin="round"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" strokeLinecap="round" strokeLinejoin="round"/></svg>,
+  Menu: (p) => <svg {...p} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M3 12h18M3 6h18M3 18h18" strokeLinecap="round"/></svg>,
   Ring: (p) => <svg {...p} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}><circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="3" fill="currentColor" opacity="0.3" /></svg>,
   Palette: (p) => <svg {...p} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10c.83 0 1.5-.67 1.5-1.5 0-.39-.15-.74-.39-1.01-.23-.26-.38-.61-.38-.99 0-.83.67-1.5 1.5-1.5H16c2.76 0 5-2.24 5-5 0-4.42-4.03-8-9-8z" /><circle cx="6.5" cy="11.5" r="1.5" fill="currentColor" /><circle cx="9.5" cy="7.5" r="1.5" fill="currentColor" /><circle cx="14.5" cy="7.5" r="1.5" fill="currentColor" /><circle cx="17.5" cy="11.5" r="1.5" fill="currentColor" /></svg>,
 };
@@ -447,74 +612,17 @@ function CreateBinderModal({ onClose }) {
 }
 
 // ─── AUTOCOMPLETE INPUT ─────────────────────────────────────────────────────
-function AutocompleteInput({ value, onChange, onSearch, placeholder }) {
-  const [suggestions, setSuggestions] = useState([]);
-  const [showSug, setShowSug] = useState(false);
-  const [loadingSug, setLoadingSug] = useState(false);
-  const debounceRef = useRef(null);
-  const containerRef = useRef(null);
-
-  useEffect(() => {
-    const handler = (e) => { if (!containerRef.current?.contains(e.target)) setShowSug(false); };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, []);
-
-  const handleChange = (e) => {
-    const v = e.target.value;
-    onChange(v);
-    clearTimeout(debounceRef.current);
-    if (v.length < 2) { setSuggestions([]); setShowSug(false); return; }
-    debounceRef.current = setTimeout(async () => {
-      setLoadingSug(true);
-      const results = await autocomplete(v);
-      setSuggestions(results);
-      setShowSug(results.length > 0);
-      setLoadingSug(false);
-    }, 280);
-  };
-
-  const handleSelect = (card) => {
-    onChange(card.name);
-    setSuggestions([]); setShowSug(false);
-    onSearch(card.name);
-  };
-
+// Input de búsqueda: busca solo al presionar Enter
+function SearchInput({ value, onChange, onSearch, placeholder }) {
   return (
-    <div ref={containerRef} className="relative flex-1">
-      <input
-        className="w-full bg-zinc-800 border border-zinc-600 rounded-xl px-4 py-2.5 text-white placeholder-zinc-500 focus:outline-none focus:border-red-500 transition-colors"
-        placeholder={placeholder}
-        value={value}
-        onChange={handleChange}
-        onFocus={() => suggestions.length > 0 && setShowSug(true)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") { setShowSug(false); onSearch(value); }
-          if (e.key === "Escape") setShowSug(false);
-        }}
-      />
-      {loadingSug && (
-        <div className="absolute right-3 top-1/2 -translate-y-1/2">
-          <div className="w-4 h-4 border-2 border-red-500 border-t-transparent rounded-full animate-spin" />
-        </div>
-      )}
-      {showSug && suggestions.length > 0 && (
-        <div className="absolute top-full mt-1 left-0 right-0 bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl z-50 overflow-hidden">
-          {suggestions.map((card) => (
-            <button key={card.id} onMouseDown={() => handleSelect(card)}
-              className="w-full flex items-center gap-3 px-3 py-2 hover:bg-zinc-800 transition-colors text-left">
-              {card.images?.small && (
-                <img src={card.images.small} alt={card.name} className="w-8 h-11 object-cover rounded flex-shrink-0" />
-              )}
-              <div className="min-w-0">
-                <p className="text-white text-sm font-medium truncate">{card.name}</p>
-                <p className="text-zinc-500 text-xs truncate">{card.set?.name}</p>
-              </div>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
+    <input
+      autoFocus
+      className="flex-1 bg-zinc-800 border border-zinc-600 rounded-xl px-4 py-2.5 text-white placeholder-zinc-500 focus:outline-none focus:border-red-500 transition-colors"
+      placeholder={placeholder}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => { if (e.key === "Enter") onSearch(value); }}
+    />
   );
 }
 
@@ -523,6 +631,59 @@ const TYPES = ["Colorless","Darkness","Dragon","Fairy","Fighting","Fire","Grass"
 const SUPERTYPES = ["Pokémon","Trainer","Energy"];
 const SUBTYPES = ["Basic","Stage 1","Stage 2","GX","EX","V","VMAX","VSTAR","ex","Mega","Prism Star","TAG TEAM","Item","Supporter","Stadium","Special","Basic Energy","Special Energy"];
 const LEGALITIES = [{value:"standard",label:"Standard"},{value:"expanded",label:"Expanded"},{value:"unlimited",label:"Unlimited"}];
+
+// Selector de set con buscador interno
+function SetSelector({ value, onChange, sets }) {
+  const [setSearch, setSetSearch] = useState("");
+  const filtered = sets.filter(s =>
+    normalize(s.name).includes(normalize(setSearch)) ||
+    normalize(s.series).includes(normalize(setSearch))
+  );
+  const selected = sets.find(s => s.id === value);
+
+  return (
+    <div>
+      <label className="block text-xs text-zinc-400 mb-1 font-medium">Set / Expansión</label>
+      <div className="bg-zinc-800 border border-zinc-700 rounded-lg overflow-hidden focus-within:border-red-500 transition-colors">
+        <div className="flex items-center gap-2 px-2 py-1.5 border-b border-zinc-700">
+          <Icon.Search className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+          <input
+            className="flex-1 bg-transparent text-xs text-white placeholder-zinc-500 focus:outline-none"
+            placeholder="Buscar set..."
+            value={setSearch}
+            onChange={e => setSetSearch(e.target.value)}
+          />
+          {setSearch && (
+            <button onClick={() => setSetSearch("")} className="text-zinc-600 hover:text-zinc-400">
+              <Icon.X className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+        <div className="overflow-y-auto" style={{ maxHeight: "120px" }}>
+          <button
+            onMouseDown={() => onChange("")}
+            className={`w-full text-left px-3 py-1.5 text-xs transition-colors ${!value ? "bg-red-600/20 text-red-300" : "text-zinc-400 hover:bg-zinc-700"}`}>
+            Todos los sets
+          </button>
+          {filtered.map(s => (
+            <button key={s.id}
+              onMouseDown={() => onChange(s.id)}
+              className={`w-full text-left px-3 py-1.5 text-xs transition-colors truncate ${value === s.id ? "bg-red-600/20 text-red-300" : "text-zinc-300 hover:bg-zinc-700"}`}
+              title={s.name}>
+              {s.name}
+            </button>
+          ))}
+          {filtered.length === 0 && (
+            <p className="px-3 py-2 text-xs text-zinc-600">Sin resultados</p>
+          )}
+        </div>
+        {selected && (
+          <div className="px-3 py-1 border-t border-zinc-700 text-[10px] text-red-400 truncate">{selected.name}</div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function FilterPanel({ filters, onChange, sets, rarities, onClear, activeCount }) {
   const [open, setOpen] = useState(false);
@@ -559,14 +720,43 @@ function FilterPanel({ filters, onChange, sets, rarities, onClear, activeCount }
         {activeCount > 0 && <span className="bg-red-500 text-white text-xs rounded-full w-4 h-4 flex items-center justify-center leading-none">{activeCount}</span>}
       </button>
       {open && (
-        <div className="absolute top-full mt-2 right-0 bg-zinc-900 border border-zinc-700 rounded-xl p-4 z-50 shadow-2xl w-[520px] grid grid-cols-3 gap-3">
-          <Sel label="Rareza" field="rarity" options={rarities.map((r) => ({ value: r, label: r }))} />
-          <Sel label="Set / Expansión" field="set" options={sets.map((s) => ({ value: s.id, label: s.name }))} />
+        <div className="absolute top-full mt-2 right-0 bg-zinc-900 border border-zinc-700 rounded-xl p-4 z-50 shadow-2xl w-[560px] flex flex-col gap-3">
+          {/* Raridades especiales rápidas */}
+          <div>
+            <label className="block text-xs text-zinc-400 mb-1.5 font-medium">Arte especial</label>
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                ["Illustration Rare", "AR 🎨"],
+                ["Special Illustration Rare", "SIR ✨"],
+                ["Double Rare", "IR 💠"],
+                ["Special Art Rare", "SAR 🌟"],
+                ["ACE SPEC Rare", "ACE ♠"],
+                ["Full Art", "FA 🖼"],
+                ["Hyper Rare", "HR 💎"],
+                ["Shiny Rare", "Shiny ⭐"],
+                ["Shiny Ultra Rare", "Shiny UR 🌠"],
+              ].map(([val, label]) => (
+                <button key={val}
+                  onMouseDown={() => onChange({ ...filters, rarity: filters.rarity === val ? "" : val })}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-all ${
+                    filters.rarity === val
+                      ? "bg-red-600/30 border-red-500 text-red-300"
+                      : "bg-zinc-800 border-zinc-700 text-zinc-300 hover:border-zinc-500"
+                  }`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="grid grid-cols-3 gap-3">
+          <Sel label="Rareza (todas)" field="rarity" options={rarities.map((r) => ({ value: r, label: r }))} />
+          <SetSelector value={filters.set || ""} onChange={(v) => onChange({ ...filters, set: v })} sets={sets} />
           <Sel label="Tipo de energía" field="type" options={TYPES} />
           <Sel label="Supertipo" field="supertype" options={SUPERTYPES} />
           <Sel label="Subtipo" field="subtype" options={SUBTYPES} />
           <Sel label="Legalidad" field="legality" options={LEGALITIES} />
-          <div className="col-span-3 flex justify-between items-center pt-1 border-t border-zinc-800">
+          </div>
+          <div className="flex justify-between items-center pt-1 border-t border-zinc-800">
             <span className="text-xs text-zinc-500">{activeCount} filtro{activeCount !== 1 ? "s" : ""} activo{activeCount !== 1 ? "s" : ""}</span>
             <div className="flex gap-2">
               {activeCount > 0 && (
@@ -583,18 +773,17 @@ function FilterPanel({ filters, onChange, sets, rarities, onClear, activeCount }
 
 // ─── CARD SEARCH PANEL ───────────────────────────────────────────────────────
 const PAGE_SIZE = 36;
-let _searchState = { query: "", filters: {}, results: [], totalCount: 0, page: 1, searched: false };
 
 function CardSearchPanel({ targetSlot, onClose }) {
   const { addCardToSlot } = useBinder();
-  const [query, setQuery] = useState(_searchState.query);
-  const [results, setResults] = useState(_searchState.results);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [searched, setSearched] = useState(_searchState.searched);
-  const [page, setPage] = useState(_searchState.page);
-  const [totalCount, setTotalCount] = useState(_searchState.totalCount);
-  const [filters, setFilters] = useState(_searchState.filters);
+  const [searched, setSearched] = useState(false);
+  const [page, setPage] = useState(1);
+  const [totalCount, setTotalCount] = useState(0);
+  const [filters, setFilters] = useState({});
   const [sets, setSets] = useState([]);
   const [rarities, setRarities] = useState([]);
 
@@ -604,10 +793,6 @@ function CardSearchPanel({ targetSlot, onClose }) {
     fetchSets().then(setSets);
     fetchRarities().then(setRarities);
   }, []);
-
-  useEffect(() => {
-    return () => { _searchState = { query, filters, results, totalCount, page, searched }; };
-  }, [query, filters, results, totalCount, page, searched]);
 
   const doSearch = useCallback(async (q, f, p) => {
     const hasQuery = q?.trim() || Object.values(f).some(Boolean);
@@ -624,7 +809,7 @@ function CardSearchPanel({ targetSlot, onClose }) {
     }
   }, []);
 
-  const handleSearch = (q = query) => { setPage(1); doSearch(q, filters, 1); };
+  const handleSearch = (q) => { const sq = (q !== undefined ? q : query); setPage(1); doSearch(sq, filters, 1); };
   const handleFilterChange = (nf) => { setFilters(nf); setPage(1); doSearch(query, nf, 1); };
   const handlePageChange = (np) => { setPage(np); doSearch(query, filters, np); };
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
@@ -651,7 +836,7 @@ function CardSearchPanel({ targetSlot, onClose }) {
           </button>
         </div>
         <div className="p-3 border-b border-zinc-800 shrink-0 flex gap-2">
-          <AutocompleteInput value={query} onChange={setQuery} onSearch={handleSearch} placeholder="Ej: Gengar, Charizard 151, Pikachu..." />
+          <SearchInput value={query} onChange={setQuery} onSearch={handleSearch} placeholder="Ej: Gengar, Prismatic Evolutions, Eevee Prismatic..." />
           <FilterPanel filters={filters} onChange={handleFilterChange} sets={sets} rarities={rarities} onClear={() => handleFilterChange({})} activeCount={activeFilterCount} />
           <button onClick={() => handleSearch()} disabled={loading}
             className="px-4 py-2.5 bg-red-600 text-white rounded-xl font-bold hover:bg-red-500 transition-colors disabled:opacity-40 shrink-0">
@@ -732,6 +917,10 @@ function CardSearchPanel({ targetSlot, onClose }) {
   );
 }
 
+// ─── DRAG & DROP ─────────────────────────────────────────────────────────────
+// Referencia global para el slot que se está arrastrando
+const dragSource = { pageIndex: null, slotIndex: null };
+
 // ─── CARD SLOT ───────────────────────────────────────────────────────────────
 function CardSlot({ card, pageIndex, slotIndex, onAdd }) {
   const { removeCardFromSlot } = useBinder();
@@ -741,27 +930,49 @@ function CardSlot({ card, pageIndex, slotIndex, onAdd }) {
     const price = getCardPrice(card);
     const pcUrl = getPriceChartingUrl(card);
     return (
-      <div className="relative rounded overflow-hidden border border-zinc-600/40 hover:border-red-500/60 transition-all cursor-default shadow-sm"
-        style={{ aspectRatio: "2.5/3.5", width: "100%" }}
+      <div className="relative rounded overflow-hidden border border-zinc-600/40 hover:border-red-500/60 transition-all shadow-sm"
+        style={{ aspectRatio: "2.5/3.5", width: "100%", cursor: "grab" }}
+        draggable
+        onDragStart={(e) => {
+          dragSource.pageIndex = pageIndex;
+          dragSource.slotIndex = slotIndex;
+          e.dataTransfer.effectAllowed = "move";
+          // Imagen semitransparente al arrastrar
+          e.dataTransfer.setDragImage(e.currentTarget, e.currentTarget.offsetWidth / 2, e.currentTarget.offsetHeight / 2);
+        }}
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
+        onDrop={(e) => {
+          e.preventDefault();
+          const { pageIndex: srcPage, slotIndex: srcSlot } = dragSource;
+          if (srcPage === null || (srcPage === pageIndex && srcSlot === slotIndex)) return;
+          // Intercambiar las cartas entre slots usando addCardToSlot
+          const srcCard = card; // la carta del destino
+          // Necesitamos acceder al binder — lo hacemos a través del contexto
+          document.dispatchEvent(new CustomEvent("vb:swapSlots", {
+            detail: { srcPage, srcSlot, dstPage: pageIndex, dstSlot: slotIndex }
+          }));
+          dragSource.pageIndex = null; dragSource.slotIndex = null;
+        }}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}>
         <img src={card.images?.small} alt={card.name} className="w-full h-full object-cover" draggable={false} />
-        <div className={`absolute inset-0 bg-black/78 flex flex-col items-center justify-center gap-1 transition-opacity p-1 ${hovered ? "opacity-100" : "opacity-0"}`}>
-          <p className="text-white text-[10px] font-semibold text-center leading-tight">{card.name}</p>
-          <p className="text-zinc-400 text-[8px] text-center leading-tight">{card.set?.name}</p>
+        <div className={`absolute inset-0 flex flex-col items-center justify-center gap-1.5 transition-opacity p-2 ${hovered ? "opacity-100" : "opacity-0"}`}
+          style={{ backdropFilter: "blur(6px)", backgroundColor: "rgba(0,0,0,0.72)" }}>
+          <p className="text-white text-[11px] font-bold text-center leading-tight drop-shadow px-1">{card.name}</p>
+          <p className="text-zinc-300 text-[9px] text-center leading-tight px-1">{card.set?.name}</p>
           {price ? (
             <a href={pcUrl} target="_blank" rel="noopener noreferrer"
-              className="text-red-400 text-[9px] font-bold hover:text-red-300 hover:underline flex items-center gap-0.5 mt-0.5">
+              className="text-red-400 text-[11px] font-bold hover:text-red-300 hover:underline flex items-center gap-0.5 mt-0.5">
               ${price.toFixed(2)} <Icon.ExternalLink className="w-2.5 h-2.5" />
             </a>
           ) : (
             <a href={pcUrl} target="_blank" rel="noopener noreferrer"
-              className="text-zinc-500 text-[8px] hover:text-zinc-300 flex items-center gap-0.5 mt-0.5">
+              className="text-zinc-400 text-[9px] hover:text-zinc-200 flex items-center gap-0.5 mt-0.5">
               Ver precio <Icon.ExternalLink className="w-2 h-2" />
             </a>
           )}
           <button onClick={() => removeCardFromSlot(pageIndex, slotIndex)}
-            className="mt-1 p-1 bg-red-600 hover:bg-red-500 text-white rounded transition-colors">
+            className="mt-1 p-1.5 bg-red-600 hover:bg-red-500 text-white rounded-lg transition-colors">
             <Icon.X className="w-3 h-3" />
           </button>
         </div>
@@ -769,10 +980,24 @@ function CardSlot({ card, pageIndex, slotIndex, onAdd }) {
     );
   }
 
+  const [dragOver, setDragOver] = useState(false);
   return (
     <button onClick={() => onAdd(pageIndex, slotIndex)}
       style={{ aspectRatio: "2.5/3.5", width: "100%" }}
-      className="rounded border border-dashed border-zinc-600/30 hover:border-red-500/50 hover:bg-red-500/5 transition-all flex items-center justify-center group">
+      className={`rounded border border-dashed transition-all flex items-center justify-center group ${
+        dragOver ? "border-red-500 bg-red-500/10" : "border-zinc-600/30 hover:border-red-500/50 hover:bg-red-500/5"
+      }`}
+      onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault(); setDragOver(false);
+        const { pageIndex: srcPage, slotIndex: srcSlot } = dragSource;
+        if (srcPage === null) return;
+        document.dispatchEvent(new CustomEvent("vb:swapSlots", {
+          detail: { srcPage, srcSlot, dstPage: pageIndex, dstSlot: slotIndex }
+        }));
+        dragSource.pageIndex = null; dragSource.slotIndex = null;
+      }}>
       <Icon.Plus className="w-4 h-4 text-zinc-700 group-hover:text-red-500 transition-colors" />
     </button>
   );
@@ -803,8 +1028,44 @@ function BinderRings({ color, count = 3 }) {
 
 // ─── BINDER PAGE VIEW ────────────────────────────────────────────────────────
 function BinderPageView({ onAddCard }) {
-  const { activeBinder, currentPage, setCurrentPage } = useBinder();
-  const [zoom, setZoom] = useState(0.85);
+  const { activeBinder, currentPage, setCurrentPage, swapSlots } = useBinder();
+  const containerRef = useRef(null);
+  const [zoom, setZoom] = useState(0.65);
+  useEffect(() => {
+    const handler = (e) => swapSlots(e.detail);
+    document.addEventListener("vb:swapSlots", handler);
+    return () => document.removeEventListener("vb:swapSlots", handler);
+  }, [swapSlots]);
+
+  // Auto-fit zoom: mide el contenedor real y calcula el zoom para que la página entre
+  useEffect(() => {
+    const fit = () => {
+      if (!containerRef.current) return;
+      const box = containerRef.current.getBoundingClientRect();
+      // Descuentos fijos: topbar de pag (~32px) + navegación (~56px) + gaps (~20px)
+      const availH = box.height - 108;
+      const availW = box.width - 40;
+      if (availH <= 0 || availW <= 0) return;
+
+      // El binder tiene aspect ratio de carta aprox: ancho / (ancho * ratio_pagina)
+      // Una página de binder es aprox 1.41 veces más alta que ancha (similar A4)
+      const pageRatio = 1.41;
+
+      // Zoom que hace que el alto entre exacto en el espacio disponible
+      // Alto del binder a zoom 100% = availW * pageRatio
+      const zoomByH = availH / (availW * pageRatio);
+
+      // Limitamos el zoom máximo al 85% para no ocupar todo el ancho
+      const ideal = Math.min(zoomByH, 0.85);
+      setZoom(Math.min(Math.max(ideal, 0.4), 1.0));
+    };
+
+    // Esperar un tick para que el DOM tenga dimensiones reales
+    const timer = setTimeout(fit, 50);
+    const obs = new ResizeObserver(fit);
+    if (containerRef.current) obs.observe(containerRef.current);
+    return () => { clearTimeout(timer); obs.disconnect(); };
+  }, [activeBinder?.id]);
 
   if (!activeBinder) return null;
   const { pages, grid, color = "#dc2626", texture = "leather" } = activeBinder;
@@ -814,7 +1075,7 @@ function BinderPageView({ onAddCard }) {
   const lightC = lighten(color, 20);
 
   return (
-    <div className="flex flex-col gap-3">
+    <div ref={containerRef} className="flex flex-col gap-3 h-full">
       {/* Top bar */}
       <div className="flex items-center justify-between shrink-0">
         <span className="text-sm text-zinc-400">
@@ -841,8 +1102,8 @@ function BinderPageView({ onAddCard }) {
       </div>
 
       {/* ── BINDER BODY ── */}
-      <div className="flex justify-start">
-        <div style={{ width: `${zoom * 100}%` }}>
+      <div className="flex justify-center">
+        <div style={{ width: `${zoom * 100}%`, maxWidth: "100%" }}>
           {/* Binder outer shell */}
           <div className="flex rounded-r-xl overflow-hidden shadow-2xl"
             style={{
@@ -873,14 +1134,14 @@ function BinderPageView({ onAddCard }) {
                 boxShadow: `inset 4px 0 12px rgba(0,0,0,0.4), inset -1px 0 4px rgba(0,0,0,0.2)`,
               }}>
               {/* Page texture overlay */}
-              <div className="absolute inset-0 opacity-[0.03]"
+              <div className="absolute inset-0 opacity-[0.03] pointer-events-none"
                 style={{
                   backgroundImage: "repeating-linear-gradient(0deg, transparent, transparent 27px, rgba(255,255,255,0.5) 27px, rgba(255,255,255,0.5) 28px)",
                   backgroundSize: "100% 28px",
                 }} />
 
               {/* Page number tab */}
-              <div className="absolute top-3 right-3 text-[9px] font-bold px-2 py-0.5 rounded-full"
+              <div className="absolute top-3 right-3 pointer-events-none text-[9px] font-bold px-2 py-0.5 rounded-full"
                 style={{ backgroundColor: `${color}33`, color: lightC, border: `1px solid ${color}44` }}>
                 {currentPage + 1}/{pages.length}
               </div>
@@ -955,11 +1216,125 @@ function BinderStatsBar({ onExport }) {
   );
 }
 
+
+// ─── EDIT BINDER MODAL ───────────────────────────────────────────────────────
+function EditBinderModal({ binder, onClose }) {
+  const { updateBinder } = useBinder();
+  const [name, setName] = useState(binder.name);
+  const [color, setColor] = useState(binder.color || "#dc2626");
+  const [texture, setTexture] = useState(binder.texture || "leather");
+
+  const handleSave = () => {
+    if (!name.trim()) return;
+    updateBinder({ id: binder.id, name: name.trim(), color, texture });
+    onClose();
+  };
+
+  const binderStyle = getBinderStyle({ color, texture });
+  const darkColor = darken(color, 50);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+      <div className="bg-zinc-900 border border-zinc-700 rounded-2xl w-full max-w-lg p-6 shadow-2xl mx-4 max-h-screen overflow-y-auto">
+        <h2 className="text-xl font-bold text-white mb-6 flex items-center gap-2">
+          <Icon.Edit className="w-5 h-5 text-red-500" /> Editar Binder
+        </h2>
+
+        <div className="space-y-5">
+          {/* Nombre */}
+          <div>
+            <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Nombre</label>
+            <input
+              autoFocus
+              className="w-full bg-zinc-800 border border-zinc-600 rounded-xl px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:border-red-500 transition-colors"
+              placeholder="Nombre del binder"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleSave()}
+            />
+          </div>
+
+          {/* Color */}
+          <div>
+            <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2 flex items-center gap-1">
+              <Icon.Palette className="w-3.5 h-3.5" /> Color de tapa
+            </label>
+            <div className="flex flex-wrap gap-2 mb-2">
+              {COLOR_PRESETS.map(({ color: c, label }) => (
+                <button key={c} title={label} onClick={() => setColor(c)}
+                  className={`w-7 h-7 rounded-full border-2 transition-all hover:scale-110 ${color === c ? "border-white scale-110" : "border-transparent"}`}
+                  style={{ backgroundColor: c }} />
+              ))}
+              <label className="relative w-7 h-7 rounded-full border-2 border-dashed border-zinc-500 hover:border-white transition-colors cursor-pointer flex items-center justify-center overflow-hidden" title="Color personalizado">
+                <span className="text-zinc-400 text-xs">+</span>
+                <input type="color" value={color} onChange={(e) => setColor(e.target.value)}
+                  className="absolute inset-0 opacity-0 cursor-pointer w-full h-full" />
+              </label>
+            </div>
+          </div>
+
+          {/* Textura */}
+          <div>
+            <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Textura</label>
+            <div className="flex gap-2 flex-wrap">
+              {Object.entries(TEXTURES).map(([key, tx]) => (
+                <button key={key} onClick={() => setTexture(key)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${texture === key ? "border-red-500 bg-red-500/15 text-red-300" : "border-zinc-700 bg-zinc-800 text-zinc-300 hover:border-zinc-500"}`}>
+                  {tx.emoji} {tx.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Preview */}
+          <div className="p-4 bg-zinc-950 rounded-xl border border-zinc-800">
+            <p className="text-xs text-zinc-600 mb-3">Vista previa</p>
+            <div className="flex items-stretch gap-0 h-28 max-w-xs mx-auto rounded-lg overflow-hidden shadow-2xl"
+              style={{ filter: "drop-shadow(0 8px 24px rgba(0,0,0,0.6))" }}>
+              <div className="w-7 flex flex-col items-center justify-center gap-1 rounded-l-lg"
+                style={{ backgroundColor: darkColor, boxShadow: "inset -2px 0 6px rgba(0,0,0,0.4)" }}>
+                {[0,1,2].map(i => (
+                  <div key={i} className="w-3 h-3 rounded-full border-2 border-white/20"
+                    style={{ backgroundColor: "rgba(255,255,255,0.1)" }} />
+                ))}
+              </div>
+              <div className="flex-1 flex flex-col items-center justify-center rounded-r-lg relative overflow-hidden" style={binderStyle}>
+                <div className="absolute inset-0" style={{ backgroundColor: `${color}dd` }} />
+                <div className="relative z-10 text-white text-xs font-bold text-center px-2 truncate w-full"
+                  style={{ textShadow: "0 1px 4px rgba(0,0,0,0.5)" }}>
+                  {name || "Nombre del binder"}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex gap-3 mt-8">
+          <button onClick={onClose} className="flex-1 py-3 rounded-xl border border-zinc-600 text-zinc-300 hover:bg-zinc-800 transition-colors font-semibold">Cancelar</button>
+          <button onClick={handleSave} disabled={!name.trim()} className="flex-1 py-3 rounded-xl bg-red-600 text-white font-bold hover:bg-red-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+            Guardar cambios
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── SIDEBAR ─────────────────────────────────────────────────────────────────
-function Sidebar({ onNewBinder }) {
+function Sidebar({ onNewBinder, onEditBinder, isOpen, onClose }) {
   const { binders, activeBinder, setActiveBinder, deleteBinder } = useBinder();
   return (
-    <aside className="w-56 bg-zinc-950 border-r border-zinc-800 flex flex-col shrink-0">
+    <>
+      {/* Overlay en mobile cuando el sidebar está abierto */}
+      {isOpen && (
+        <div className="fixed inset-0 bg-black/60 z-20 md:hidden" onClick={onClose} />
+      )}
+      <aside className={`
+        fixed md:relative inset-y-0 left-0 z-30 md:z-auto
+        w-64 md:w-56 bg-zinc-950 border-r border-zinc-800 flex flex-col shrink-0
+        transition-transform duration-300 ease-in-out
+        ${isOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"}
+      `}>
       <div className="p-3 border-b border-zinc-800">
         <button onClick={onNewBinder}
           className="w-full flex items-center justify-center gap-2 py-2 px-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl transition-colors text-sm">
@@ -979,7 +1354,7 @@ function Sidebar({ onNewBinder }) {
           const isActive = activeBinder?.id === b.id;
           const c = b.color || "#dc2626";
           return (
-            <div key={b.id} onClick={() => setActiveBinder(b)}
+            <div key={b.id} onClick={() => { setActiveBinder(b); if (onClose) onClose(); }}
               className={`group flex items-center gap-2 rounded-xl px-3 py-2.5 cursor-pointer transition-all ${isActive ? "border" : "hover:bg-zinc-800/60 border border-transparent"}`}
               style={isActive ? { backgroundColor: `${c}18`, borderColor: `${c}40` } : {}}>
               {/* Mini binder icon */}
@@ -991,10 +1366,16 @@ function Sidebar({ onNewBinder }) {
                 <p className="text-xs font-semibold truncate" style={isActive ? { color: lighten(c, 40) } : { color: "#e4e4e7" }}>{b.name}</p>
                 <p className="text-xs text-zinc-600">{b.grid?.label} · {cards}/{total}</p>
               </div>
-              <button onClick={(e) => { e.stopPropagation(); if (confirm(`¿Eliminar "${b.name}"?`)) deleteBinder(b.id); }}
-                className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-400 transition-all p-0.5 shrink-0">
-                <Icon.Trash className="w-3 h-3" />
-              </button>
+              <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-all shrink-0">
+                <button onClick={(e) => { e.stopPropagation(); onEditBinder(b); }}
+                  className="text-zinc-600 hover:text-zinc-300 p-0.5 transition-colors">
+                  <Icon.Edit className="w-3 h-3" />
+                </button>
+                <button onClick={(e) => { e.stopPropagation(); if (confirm(`¿Eliminar "${b.name}"?`)) deleteBinder(b.id); }}
+                  className="text-zinc-600 hover:text-red-400 p-0.5 transition-colors">
+                  <Icon.Trash className="w-3 h-3" />
+                </button>
+              </div>
             </div>
           );
         })}
@@ -1003,6 +1384,7 @@ function Sidebar({ onNewBinder }) {
         <p className="text-xs text-zinc-700 text-center">{binders.length} binder{binders.length !== 1 ? "s" : ""} locales</p>
       </div>
     </aside>
+    </>
   );
 }
 
@@ -1111,7 +1493,9 @@ function EmptyState({ onNew }) {
 function AppContent() {
   const { activeBinder } = useBinder();
   const [showCreate, setShowCreate] = useState(false);
+  const [editBinder, setEditBinder] = useState(null);
   const [targetSlot, setTargetSlot] = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const handleAddCard = useCallback((pi, si) => setTargetSlot({ pageIndex: pi, slotIndex: si }), []);
 
   // Update document title & favicon
@@ -1135,7 +1519,12 @@ function AppContent() {
 
   return (
     <div className="flex flex-col h-screen bg-zinc-950 text-white">
-      <header className="flex items-center gap-3 px-5 py-2.5 bg-zinc-950 border-b border-zinc-800 shrink-0">
+      <header className="flex items-center gap-3 px-4 py-2.5 bg-zinc-950 border-b border-zinc-800 shrink-0">
+        {/* Hamburger - solo mobile */}
+        <button onClick={() => setSidebarOpen(o => !o)}
+          className="md:hidden p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors shrink-0">
+          <Icon.Menu className="w-5 h-5" />
+        </button>
         <div className="flex items-center gap-2">
           <Icon.Pokeball className="w-7 h-7 text-red-500" />
           <span className="font-black text-base tracking-tight">Virtual<span className="text-red-500">Binder</span></span>
@@ -1155,7 +1544,7 @@ function AppContent() {
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar onNewBinder={() => setShowCreate(true)} />
+        <Sidebar onNewBinder={() => { setShowCreate(true); setSidebarOpen(false); }} onEditBinder={(b) => { setEditBinder(b); setSidebarOpen(false); }} isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
         <main className="flex-1 flex flex-col overflow-hidden">
           {activeBinder ? (
             <>
@@ -1171,6 +1560,7 @@ function AppContent() {
       </div>
 
       {showCreate && <CreateBinderModal onClose={() => setShowCreate(false)} />}
+      {editBinder && <EditBinderModal binder={editBinder} onClose={() => setEditBinder(null)} />}
       {targetSlot && <CardSearchPanel targetSlot={targetSlot} onClose={() => setTargetSlot(null)} />}
     </div>
   );
